@@ -14,7 +14,7 @@
     "cron",
     "node"
   ],
-  "author": "Young Gee",
+  "author": "Innocent Gooodness",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.12.2",
