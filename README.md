@@ -77,7 +77,8 @@ https://your-app-name.onrender.com
 
 Visit the deployed URL (e.g. https://your-app.onrender.com),
 You should see:
-
+**Note: If you see a 401 Unauthorized error in the logs, don’t worry — it’s still working.**
+The ping request successfully wakes your Supabase instance even if authentication isn’t provided. The 401 just means the public endpoint requires an API key to access data, but the server still becomes active.
 ✅ Supabase Keep-Alive Service is running!
 
 ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
