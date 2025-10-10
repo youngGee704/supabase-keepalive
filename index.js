@@ -11,7 +11,19 @@ const SUPABASE_APIS = [
 //yd_xm
   "https://ojxmkrxjqqiuljbjlzbp.supabase.co/rest/v1/",
 //chef_ivy
- "https://eevhvgzgyfelrnfrovrt.supabase.co/rest/v1/"
+ "https://eevhvgzgyfelrnfrovrt.supabase.co/rest/v1/",
+//sui-autoforge
+ "https://krryepbfnchjpvtanhqf.supabase.co/rest/v1/",
+//victory-mode
+ "https://dxdlbdqbmwrnrzxrjsya.supabase.co/rest/v1/",
+//focusMe-app
+ "https://ynejsrlwwsoxnrvmpdnb.supabase.co/rest/v1/",
+//my-porfolio
+ "https://nmsvurpcujgjqpcalldh.supabase.co/rest/v1/",
+//snag-app
+ "https://sfmntmmyfxzjgorcbrjo.supabase.co/rest/v1/",
+//nexu-mandiri
+ "https://jaystmavbrhuwuihfnkg.supabase.co/rest/v1/"
 ];
 
 // Function to ping all Supabase projects
