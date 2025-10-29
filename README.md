@@ -30,11 +30,11 @@ npm install
 ### 3️⃣ Add your Supabase project URLs
 Edit the SUPABASE_APIS array in index.js:
 ```bash
-const SUPABASE_APIS = [
-  // Replace with your Supabase project URLs
-  "https://your-project-1.supabase.co/rest/v1/",
-  "https://your-project-2.supabase.co/rest/v1/"
-];
+//add this to the env file and add your project URL in this format  separated with commas 
+# Comma-separated Supabase REST API URLs
+SUPABASE_URLS=https://your-project-url.supabase.co/rest/v1/,https://your-project-url.supabase.co/rest/v1/,...
+
+
 ```
 🟡 Note:
 You can find your Supabase project’s REST URL by going to:
