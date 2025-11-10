@@ -1,86 +1,196 @@
 import express from "express";
 import axios from "axios";
 import cron from "node-cron";
+import dotenv from "dotenv";
+
+// 🔧 Load environment variables from .env file
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🟩 Load Supabase URLs from environment variable
+// 🟩 Configuration - ONLY URLs needed
 const SUPABASE_URLS = process.env.SUPABASE_URLS 
   ? process.env.SUPABASE_URLS.split(',').map(url => url.trim())
   : [];
 
-// 🔑 Optional: Load Supabase API keys (if needed)
-const SUPABASE_KEYS = process.env.SUPABASE_KEYS
-  ? process.env.SUPABASE_KEYS.split(',').map(key => key.trim())
-  : [];
+// Auto-detect Render URL
+const getSelfUrl = () => {
+  // Render provides RENDER_EXTERNAL_URL automatically
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL;
+  }
+  // Fallback for local testing
+  return `http://localhost:${PORT}`;
+};
 
-// 🧠 Function to ping all Supabase projects to prevent them from sleeping
+const SELF_URL = getSelfUrl();
+
+// Store ping statistics
+const stats = {
+  lastSupabasePing: null,
+  lastSelfPing: null,
+  totalPings: 0,
+  successfulPings: 0,
+  failedPings: 0,
+  startTime: new Date()
+};
+
+// 🧠 Function to ping all Supabase projects
 const pingSupabase = async () => {
   if (SUPABASE_URLS.length === 0) {
     console.log("⚠️ No Supabase URLs configured. Add SUPABASE_URLS to your .env file");
-    return;
+    return { success: false, message: "No URLs configured" };
   }
 
-  console.log(`🔁 Running scheduled Supabase pings at ${new Date().toISOString()}...`);
+  const timestamp = new Date().toISOString();
+  console.log(`\n🔁 Pinging ${SUPABASE_URLS.length} Supabase project(s) at ${timestamp}...`);
   
-  for (let i = 0; i < SUPABASE_URLS.length; i++) {
-    const url = SUPABASE_URLS[i];
-    const headers = {};
-    
-    // Add API key if available
-    if (SUPABASE_KEYS[i]) {
-      headers['apikey'] = SUPABASE_KEYS[i];
-      headers['Authorization'] = `Bearer ${SUPABASE_KEYS[i]}`;
-    }
-
+  const results = [];
+  
+  for (const url of SUPABASE_URLS) {
     try {
+      const startTime = Date.now();
       const response = await axios.get(url, { 
         timeout: 10000,
-        headers 
+        validateStatus: () => true // Accept any status code
       });
-      console.log(`✅ ${url} responded with status ${response.status}`);
+      const responseTime = Date.now() - startTime;
+      
+      console.log(`✅ ${url} - Status ${response.status} (${responseTime}ms)`);
+      results.push({ url, status: response.status, success: true, responseTime });
+      stats.successfulPings++;
     } catch (error) {
-      if (error.response) {
-        console.error(`❌ ${url} responded with status ${error.response.status}: ${error.message}`);
-      } else {
-        console.error(`❌ Error pinging ${url}: ${error.message}`);
-      }
+      console.error(`❌ ${url} - ${error.message}`);
+      results.push({ url, success: false, error: error.message });
+      stats.failedPings++;
     }
   }
+  
+  stats.totalPings++;
+  stats.lastSupabasePing = timestamp;
+  
   console.log(`✅ Ping cycle completed at ${new Date().toISOString()}\n`);
+  
+  return { success: true, timestamp, results };
 };
 
-// 🔹 Run immediately on startup
+// 🔄 Self-ping to keep THIS service alive on Render
+const selfPing = async () => {
+  try {
+    await axios.get(`${SELF_URL}/health`, { 
+      timeout: 5000,
+      validateStatus: () => true
+    });
+    stats.lastSelfPing = new Date().toISOString();
+    console.log(`🔄 Self-ping OK - Service stays awake`);
+  } catch (error) {
+    console.error(`❌ Self-ping failed: ${error.message}`);
+  }
+};
+
+// 🔹 Run Supabase ping immediately on startup
+console.log("🚀 Starting up - Running initial Supabase ping...");
 pingSupabase();
 
-// 🔹 Schedule: every 24 hours at midnight UTC
-// "0 0 * * *" = At 00:00 (midnight) every day
-cron.schedule("0 0 * * *", () => {
-  pingSupabase();
-});
-
-// 💡 Optional: Add manual trigger endpoint
-app.get("/ping", async (req, res) => {
+// 🔹 Schedule Supabase pings: Every 24 hours at midnight UTC
+cron.schedule("0 0 * * *", async () => {
+  console.log("⏰ 24-hour trigger - Pinging Supabase projects");
   await pingSupabase();
+}, {
+  timezone: "UTC"
+});
+
+// 🔹 Keep service awake: Self-ping every 14 minutes
+// (Render free tier sleeps after 15 min inactivity)
+cron.schedule("*/14 * * * *", async () => {
+  await selfPing();
+}, {
+  timezone: "UTC"
+});
+
+// 💡 Manual trigger endpoint
+app.get("/ping", async (req, res) => {
+  console.log("🖱️ Manual ping triggered via /ping endpoint");
+  const result = await pingSupabase();
   res.json({ 
-    message: "Ping cycle completed", 
-    timestamp: new Date().toISOString(),
-    urls: SUPABASE_URLS.length
+    message: "Manual ping completed", 
+    ...result,
+    stats: {
+      total: stats.totalPings,
+      successful: stats.successfulPings,
+      failed: stats.failedPings
+    }
   });
 });
 
-app.get("/", (req, res) => {
+// 🏥 Health check endpoint (for self-pinging)
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "healthy",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 📊 Stats endpoint
+app.get("/stats", (req, res) => {
+  const uptime = Math.floor((Date.now() - stats.startTime.getTime()) / 1000);
+  
   res.json({
-    status: "✅ Supabase Keep-Alive Service is running!",
+    service: "Supabase Keep-Alive",
+    uptime_seconds: uptime,
+    uptime_human: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`,
     configured_urls: SUPABASE_URLS.length,
-    next_ping: "Every 24 hours at midnight UTC",
-    manual_trigger: "/ping"
+    last_supabase_ping: stats.lastSupabasePing || "Not yet run",
+    last_self_ping: stats.lastSelfPing || "Not yet run",
+    total_pings: stats.totalPings,
+    successful_pings: stats.successfulPings,
+    failed_pings: stats.failedPings,
+    success_rate: stats.totalPings > 0 
+      ? `${((stats.successfulPings / (stats.successfulPings + stats.failedPings)) * 100).toFixed(1)}%`
+      : "N/A"
   });
 });
 
+// 🏠 Home endpoint
+app.get("/", (req, res) => {
+  const uptime = Math.floor((Date.now() - stats.startTime.getTime()) / 1000);
+  
+  res.json({
+    status: "✅ Supabase Keep-Alive Service Running",
+    service_url: SELF_URL,
+    monitoring: `${SUPABASE_URLS.length} Supabase project(s)`,
+    schedules: {
+      supabase_ping: "Every 24 hours at 00:00 UTC",
+      self_ping: "Every 14 minutes (keeps service awake)"
+    },
+    endpoints: {
+      manual_ping: `${SELF_URL}/ping`,
+      health_check: `${SELF_URL}/health`,
+      statistics: `${SELF_URL}/stats`
+    },
+    stats: {
+      uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`,
+      last_ping: stats.lastSupabasePing || "Not yet run",
+      total_pings: stats.totalPings,
+      success_rate: stats.totalPings > 0 
+        ? `${((stats.successfulPings / (stats.successfulPings + stats.failedPings)) * 100).toFixed(1)}%`
+        : "N/A"
+    }
+  });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📊 Monitoring ${SUPABASE_URLS.length} Supabase project(s)`);
-  console.log(`⏰ Scheduled pings: Every 24 hours at midnight UTC (cron: "0 0 * * *")`);
+  console.log(`\n${"=".repeat(70)}`);
+  console.log(`🚀 SUPABASE KEEP-ALIVE SERVICE STARTED`);
+  console.log(`${"=".repeat(70)}`);
+  console.log(`📍 Service URL: ${SELF_URL}`);
+  console.log(`📊 Monitoring: ${SUPABASE_URLS.length} Supabase project(s)`);
+  console.log(`⏰ Supabase Pings: Every 24 hours at midnight UTC`);
+  console.log(`🔄 Self-Ping: Every 14 minutes (keeps service awake on Render)`);
+  console.log(`${"=".repeat(70)}`);
+  console.log(`\n📌 Your Supabase URLs:`);
+  SUPABASE_URLS.forEach((url, i) => console.log(`   ${i + 1}. ${url}`));
+  console.log(`\n✅ Service is ready and will run 24/7!\n`);
 });
