@@ -1,25 +1,29 @@
 {
   "name": "supabase-keepalive",
-  "version": "1.0.0",
-  "description": "A simple Node.js service to keep multiple Supabase projects active by pinging their REST endpoints periodically.",
+  "version": "2.0.0",
+  "description": "Keep Supabase free tier projects alive by pinging them every 6 hours",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "keywords": [
     "supabase",
-    "keep-alive",
+    "keepalive",
     "render",
-    "cron",
-    "node"
+    "ping",
+    "uptime"
   ],
-  "author": "Innocent Gooodness",
+  "author": "",
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.12.2",
-    "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "node-cron": "^4.2.1"
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
