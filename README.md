@@ -43,13 +43,27 @@ npm install -g wrangler
 # or use without global install: npx wrangler
 ```
 
-2. **Login to your Cloudflare account**:
-```bash
-npx wrangler login
-```
-*(If the browser popup fails or you are in a headless environment, run `npx wrangler login --device` instead).*
+2. **Create an API Token:**
+   - Go to the Cloudflare Dashboard.
+   - Navigate to **My Profile** > **API Tokens** > **Create Token**.
+   - Choose the **"Edit Cloudflare Workers"** template, create it, and copy the token.
+   - *(Important: You will only see this token once).*
 
-3. **Create the KV Namespace**:
+3. **Set the Token in your Terminal:**
+   - For Windows (PowerShell):
+     ```powershell
+     $env:CLOUDFLARE_API_TOKEN="your_token_here"
+     ```
+   - For Mac/Linux:
+     ```bash
+     export CLOUDFLARE_API_TOKEN="your_token_here"
+     ```
+   - *(To make this permanent, add it to your `.bashrc` or Windows Environment Variables).*
+
+4. **Verify Authentication:**
+   - Run `npx wrangler whoami`. If it prints your account details, you are good to go.
+
+5. **Create the KV Namespace:**
 ```bash
 npx wrangler kv namespace create SUPABASE_PROJECTS
 ```
