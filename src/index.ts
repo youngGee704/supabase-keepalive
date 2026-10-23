@@ -166,7 +166,6 @@ function parseCookies(cookieHeader: string | null): Record<string, string> {
 export function isAuthenticated(request: Request, env: Env): boolean {
   const secret = env.AUTH_SECRET;
   if (!secret) {
-    // If AUTH_SECRET is not configured, reject all requests until set
     return false;
   }
 
@@ -989,37 +988,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         });
       }
 
-      const newProject: SupabaseProject = { name, url: projectUrl, anonKey };
-
-      // Write-verify-retry loop (up to 3 attempts) to prevent lost updates
-      let persisted = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const current = await getProjectsFromKV(env);
-        if (current.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-          return new Response(JSON.stringify({ error: `Project with name "${name}" already exists` }), {
-            status: 409,
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-
-        const updated = [...current, newProject];
-        await saveProjectsToKV(env, updated);
-
-        // Read back and verify write landed
-        const verified = await getProjectsFromKV(env);
-        if (verified.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-          persisted = true;
-          break;
-        }
-        console.warn(`[KV Conflict] Write verification failed on attempt ${attempt}/3. Retrying...`);
-      }
-
-      if (!persisted) {
-        return new Response(JSON.stringify({ error: "Failed to persist project after 3 attempts due to concurrent KV updates" }), {
-          status: 500,
+      const projects = await getProjectsFromKV(env);
+      if (projects.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+        return new Response(JSON.stringify({ error: `Project with name "${name}" already exists` }), {
+          status: 409,
           headers: { "Content-Type": "application/json" }
         });
       }
+
+      const newProject: SupabaseProject = { name, url: projectUrl, anonKey };
+      projects.push(newProject);
+      await saveProjectsToKV(env, projects);
 
       // Test ping after saving (do not block saving on failure)
       const pingResult = await pingProject(newProject);
@@ -1050,35 +1029,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         });
       }
 
-      let deleted = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const projects = await getProjectsFromKV(env);
-        const filtered = projects.filter(p => p.name.toLowerCase() !== name.toLowerCase());
+      const projects = await getProjectsFromKV(env);
+      const updated = projects.filter(p => p.name.toLowerCase() !== name.toLowerCase());
 
-        if (filtered.length === projects.length) {
-          return new Response(JSON.stringify({ error: `Project "${name}" not found` }), {
-            status: 404,
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-
-        await saveProjectsToKV(env, filtered);
-
-        // Verify delete landed
-        const verified = await getProjectsFromKV(env);
-        if (!verified.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-          deleted = true;
-          break;
-        }
-        console.warn(`[KV Conflict] Delete verification failed on attempt ${attempt}/3. Retrying...`);
-      }
-
-      if (!deleted) {
-        return new Response(JSON.stringify({ error: "Failed to delete project after 3 attempts due to concurrent KV updates" }), {
-          status: 500,
+      if (updated.length === projects.length) {
+        return new Response(JSON.stringify({ error: `Project "${name}" not found` }), {
+          status: 404,
           headers: { "Content-Type": "application/json" }
         });
       }
+
+      await saveProjectsToKV(env, updated);
 
       return new Response(JSON.stringify({ success: true }), {
         status: 200,

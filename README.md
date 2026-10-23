@@ -137,7 +137,7 @@ Responses from `POST /api/projects` and `POST /api/test` return clean reason cod
 
 ---
 
-## 5. Storage Schema & Concurrency
+## 5. Storage Schema & Limitations
 
 - **KV Schema**: Stored under key `"projects"` as versioned JSON:
   ```json
@@ -149,7 +149,10 @@ Responses from `POST /api/projects` and `POST /api/test` return clean reason cod
   }
   ```
   The reader also supports bare arrays (`[...]`) for backwards compatibility.
-- **Concurrency Mitigation**: Designed for single-user management. Write paths (`POST /api/projects` and `DELETE /api/projects`) implement a read-back verification loop with up to 3 retry attempts to mitigate lost updates across multiple tabs.
+
+### Limitations
+- **KV Eventual Consistency**: Cloudflare Workers KV is an eventually consistent key-value store without atomic compare-and-swap (CAS) transactions. Concurrent adds or deletes from two browser tabs within ~60 seconds may lose an update. This is an architectural characteristic of KV.
+- **Single-Tab Recommendation**: This service is designed as a personal management utility. Use the dashboard from a single browser tab at a time. If high-concurrency ACID transactions are ever required for multi-tenant SaaS scaling, migrate the storage layer to Cloudflare D1 or Durable Objects.
 
 ---
 
