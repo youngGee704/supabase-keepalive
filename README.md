@@ -1,24 +1,24 @@
-# Supabase Keep-Alive (Cloudflare Worker)
+# Supabase Keep-Alive
 
-Keeps Supabase free-tier projects active by executing scheduled pings every 6 hours via Cloudflare Workers and Cron Triggers. Projects are managed dynamically via a web UI and stored securely in Cloudflare Workers KV.
+A lightweight Cloudflare Worker that prevents free-tier Supabase projects from pausing due to inactivity.
 
-## Architecture
+It runs a scheduled cron job every 6 hours, pinging a simple table in each of your Supabase databases. You can manage the list of projects through a built-in web UI.
 
-- **Runtime:** Cloudflare Workers (TypeScript, Strict Mode, zero runtime dependencies)
-- **Database / Storage:** Cloudflare Workers KV (`SUPABASE_PROJECTS` namespace, schema: `{ version: 1, projects: [...] }`)
-- **Scheduler:** Cron Trigger (`0 */6 * * *` - every 6 hours)
-- **Security:** `AUTH_SECRET` gate via session cookie (`HttpOnly`, `Secure`, `SameSite=Strict`) and `Authorization: Bearer`
-- **UI:** Server-rendered minimal monospace dark UI for adding, testing, and deleting projects
-- **Target Ping Endpoint:** `GET {url}/rest/v1/keepalive?select=*&limit=1`
+## How it works
 
----
+1. **Cloudflare Workers**: Hosts the UI and handles the scheduled cron job. (It never sleeps).
+2. **Cloudflare KV**: Stores your list of Supabase projects.
+3. **Supabase REST API**: The Worker sends a GET request to a `keepalive` table to trigger database activity.
 
-## 1. Supabase Database Preparation
+## 1. Supabase Setup (Required for every project)
 
-Each Supabase project to be kept alive must have the `keepalive` table created. Run the following SQL migration in your project's SQL Editor:
+For each Supabase project you want to keep alive, you must create a table that the Worker can ping.
+
+1. Go to your Supabase project dashboard.
+2. Open the **SQL Editor**.
+3. Paste and run the following SQL:
 
 ```sql
--- migrations/001_keepalive.sql
 create table if not exists public.keepalive (
   id smallint primary key default 1,
   pinged_at timestamptz not null default now()
@@ -29,135 +29,45 @@ create policy "anon can read keepalive"
   on public.keepalive for select to anon using (true);
 ```
 
----
+> **Note:** If you skip this, the dashboard will show a ❌ 404 error when you click "Test".
 
-## 2. Authentication
+## 2. Deployment
 
-The Worker is protected by an `AUTH_SECRET` environment secret. It is never committed to source control or stored in KV.
+You need a Cloudflare account.
 
-### Setting the Secret in Production
+### Set up authentication
+The dashboard is protected by a password. Generate a secret key:
+
 ```bash
 npx wrangler secret put AUTH_SECRET
 ```
-You will be prompted to enter a long random secret key.
+(Paste a long random string when prompted. You will use this to log in).
 
-### Local Development Authentication
-Create a `.dev.vars` file in the project root (ignored by git):
+### Deploy
 ```bash
-AUTH_SECRET=local-dev-secret-key-12345
+npx wrangler deploy
+```
+Wrangler will give you a live URL (e.g., `https://supabase-keepalive.your-name.workers.dev`). Open it, log in with your `AUTH_SECRET`, and add your projects.
+
+## Local Development
+To run the worker locally for testing:
+
+1. Create a `.dev.vars` file in the root directory:
+```env
+AUTH_SECRET=local-password
 ```
 
-### Access Rules
-- **Dashboard (`GET /`)**: Returns HTTP 401 with an unlock password form if unauthenticated. Submitting the correct password posts to `POST /auth`, setting a `session` cookie (`HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`).
-- **REST APIs (`/api/*`)**: Require either a valid `session` cookie or `Authorization: Bearer <AUTH_SECRET>`. Unauthenticated requests receive HTTP 401 JSON `{ "error": "unauthorized" }`.
-- **Logout (`POST /auth/logout`)**: Clears the session cookie and redirects back to `/`.
-
----
-
-## 3. Cloudflare Setup & Deployment
-
-### Step 1: Install Dependencies
+2. Start the dev server:
 ```bash
-pnpm install
+npx wrangler dev --test-scheduled
 ```
+Open `http://localhost:8787` and log in with `local-password`.
 
-### Step 2: Create Workers KV Namespace
-Create the production KV namespace:
+3. To test the cron job locally, open a second terminal and run:
 ```bash
-pnpm exec wrangler kv namespace create SUPABASE_PROJECTS
+curl.exe "http://localhost:8787/__scheduled?cron=0+*/6+*+*+*"
 ```
 
-The output will contain:
-```toml
-[[kv_namespaces]]
-binding = "SUPABASE_PROJECTS"
-id = "<KV_NAMESPACE_ID>"
-```
-
-### Step 3: Update `wrangler.toml`
-Paste the generated ID into `wrangler.toml`:
-```toml
-name = "supabase-keepalive"
-main = "src/index.ts"
-compatibility_date = "2024-04-03"
-
-[[kv_namespaces]]
-binding = "SUPABASE_PROJECTS"
-id = "<YOUR_PRODUCTION_KV_ID>"
-
-[triggers]
-crons = ["0 */6 * * *"]
-```
-
-### Step 4: Configure `AUTH_SECRET`
-```bash
-pnpm exec wrangler secret put AUTH_SECRET
-```
-
-### Step 5: Local Development & Testing
-Start the local worker dev server:
-```bash
-pnpm dev
-```
-Open `http://localhost:8787` in your browser.
-
-#### Manually Trigger the Cron Locally
-In a separate terminal, trigger the scheduled cron execution:
-```bash
-curl "http://localhost:8787/__scheduled?cron=0+*/6+*+*+*"
-```
-
-### Step 6: Deploy to Cloudflare
-```bash
-pnpm deploy
-```
-
----
-
-## 4. API Reference
-
-All `/api/*` endpoints require authentication (`Cookie: session=...` or `Authorization: Bearer <AUTH_SECRET>`).
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Serves unlock form (if 401) or dashboard UI |
-| `POST` | `/auth` | Validates password, sets session cookie, redirects to `/` |
-| `POST` | `/auth/logout` | Clears session cookie, redirects to `/` |
-| `GET` | `/api/projects` | Returns project list with masked anon keys (`{ name, url, anonKey }[]`) |
-| `POST` | `/api/projects` | Adds a project (`{ name, url, anonKey }`), validates, tests connection, and appends to KV |
-| `DELETE` | `/api/projects?name=<name>` | Deletes the specified project from KV |
-| `POST` | `/api/test?name=<name>` | Tests connectivity for a specific project server-side and returns ping status |
-
-### Ping Reason Codes
-Responses from `POST /api/projects` and `POST /api/test` return clean reason codes without leaking raw stack traces or internal URLs:
-- `ok`: Ping succeeded with HTTP 200.
-- `missing_table`: Returned HTTP 404 (the `keepalive` table migration has not been applied).
-- `http_error`: Target returned non-200 HTTP status (e.g. 401, 500).
-- `network_error`: Network connection failure, timeout, or invalid hostname.
-
----
-
-## 5. Storage Schema & Limitations
-
-- **KV Schema**: Stored under key `"projects"` as versioned JSON:
-  ```json
-  {
-    "version": 1,
-    "projects": [
-      { "name": "prod-db", "url": "https://xyz.supabase.co", "anonKey": "..." }
-    ]
-  }
-  ```
-  The reader also supports bare arrays (`[...]`) for backwards compatibility.
-
-### Limitations
-- **KV Eventual Consistency**: Cloudflare Workers KV is an eventually consistent key-value store without atomic compare-and-swap (CAS) transactions. Concurrent adds or deletes from two browser tabs within ~60 seconds may lose an update. This is an architectural characteristic of KV.
-- **Single-Tab Recommendation**: This service is designed as a personal management utility. Use the dashboard from a single browser tab at a time. If high-concurrency ACID transactions are ever required for multi-tenant SaaS scaling, migrate the storage layer to Cloudflare D1 or Durable Objects.
-
----
-
-## 6. Quality Checks
-
-```bash
-pnpm typecheck
-```
+## Limitations
+- **Single User Only**: The UI does not support multiple accounts. Anyone with the `AUTH_SECRET` has full access.
+- **KV Eventual Consistency**: Cloudflare KV updates are eventually consistent. If you open two browser tabs and add/delete projects at the exact same time, you might lose an update. Use one tab at a time.
