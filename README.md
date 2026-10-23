@@ -35,6 +35,33 @@ create policy "anon can read keepalive"
 
 You need a Cloudflare account.
 
+### Prerequisites & Login
+
+1. **Install Wrangler** (globally or use via `npx`):
+```bash
+npm install -g wrangler
+# or use without global install: npx wrangler
+```
+
+2. **Login to your Cloudflare account**:
+```bash
+npx wrangler login
+```
+*(If the browser popup fails or you are in a headless environment, run `npx wrangler login --device` instead).*
+
+3. **Create the KV Namespace**:
+```bash
+npx wrangler kv namespace create SUPABASE_PROJECTS
+```
+Copy the generated `id` from the output and paste it into your `wrangler.toml` file under `[[kv_namespaces]]`:
+```toml
+[[kv_namespaces]]
+binding = "SUPABASE_PROJECTS"
+id = "<YOUR_KV_NAMESPACE_ID>"
+```
+
+*(Note: If you encounter a Cloudflare "memberships" error during deployment, locate your Cloudflare **Account ID** in the Cloudflare dashboard and add `account_id = "<YOUR_ACCOUNT_ID>"` near the top of `wrangler.toml`).*
+
 ### Set up authentication
 The dashboard is protected by a password. Generate a secret key:
 
@@ -56,6 +83,7 @@ To run the worker locally for testing:
 ```env
 AUTH_SECRET=local-password
 ```
+> **Important:** Ensure `.dev.vars` is listed in your `.gitignore` so your local password/secret is never committed to GitHub.
 
 2. Start the dev server:
 ```bash
