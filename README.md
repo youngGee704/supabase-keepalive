@@ -1,215 +1,73 @@
-# 🚀 Supabase Keep-Alive Service - Complete Setup Guide
+# Supabase Keep-Alive
 
-## What This Solves
+A lightweight Cloudflare Worker that prevents free-tier Supabase projects from pausing due to inactivity.
 
-**Problem**: Supabase free tier pauses projects after 7 days of inactivity.  
-**Solution**: This service pings your Supabase projects every 6 hours to keep them active.
+It runs a scheduled cron job every 6 hours, pinging a simple table in each of your Supabase databases. You can manage the list of projects through a built-in web UI.
 
----
+## How it works
 
-## 📋 Prerequisites
+1. **Cloudflare Workers**: Hosts the UI and handles the scheduled cron job. (It never sleeps).
+2. **Cloudflare KV**: Stores your list of Supabase projects.
+3. **Supabase REST API**: The Worker sends a GET request to a `keepalive` table to trigger database activity.
 
-1. Node.js installed (v16+)
-2. A Render.com account (free tier works)
-3. UptimeRobot account (free - to keep Render service awake)
+## 1. Supabase Setup (Required for every project)
 
----
+For each Supabase project you want to keep alive, you must create a table that the Worker can ping.
 
-## 🔧 Setup Instructions
+1. Go to your Supabase project dashboard.
+2. Open the **SQL Editor**.
+3. Paste and run the following SQL:
 
-### Step 1: Get Your Supabase Project IDs
+```sql
+create table if not exists public.keepalive (
+  id smallint primary key default 1,
+  pinged_at timestamptz not null default now()
+);
+insert into public.keepalive (id) values (1) on conflict do nothing;
+alter table public.keepalive enable row level security;
+create policy "anon can read keepalive"
+  on public.keepalive for select to anon using (true);
+```
 
-1. Go to your Supabase dashboard: https://app.supabase.com
-2. Find your project URL (looks like: `https://abc123xyz.supabase.co`)
-3. Copy only the project ID part: `abc123xyz`
-4. Repeat for each project you want to monitor
+> **Note:** If you skip this, the dashboard will show a ❌ 404 error when you click "Test".
 
-### Step 2: Configure Environment Variables
+## 2. Deployment
 
-Create a `.env` file:
+You need a Cloudflare account.
+
+### Set up authentication
+The dashboard is protected by a password. Generate a secret key:
 
 ```bash
-# Single project
-SUPABASE_PROJECT_IDS=abc123xyz
-
-# Multiple projects (comma-separated)
-SUPABASE_PROJECT_IDS=abc123xyz,def456uvw,ghi789rst
+npx wrangler secret put AUTH_SECRET
 ```
+(Paste a long random string when prompted. You will use this to log in).
 
-**That's it!** No need to write full URLs anymore.
-
-### Step 3: Test Locally (Optional)
-
+### Deploy
 ```bash
-npm install
-npm start
+npx wrangler deploy
+```
+Wrangler will give you a live URL (e.g., `https://supabase-keepalive.your-name.workers.dev`). Open it, log in with your `AUTH_SECRET`, and add your projects.
+
+## Local Development
+To run the worker locally for testing:
+
+1. Create a `.dev.vars` file in the root directory:
+```env
+AUTH_SECRET=local-password
 ```
 
-Visit `http://localhost:3000` to see the service running.
-
----
-
-## 🚀 Deploy to Render
-
-### Option A: Deploy from GitHub (Recommended)
-
-1. Push your code to GitHub
-2. Go to [Render Dashboard](https://dashboard.render.com/)
-3. Click **New +** → **Web Service**
-4. Connect your GitHub repository
-5. Configure:
-   - **Name**: `supabase-keepalive` (or any name)
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `npm start`
-   - **Instance Type**: `Free`
-6. Add Environment Variable:
-   - **Key**: `SUPABASE_PROJECT_IDS`
-   - **Value**: `abc123xyz,def456uvw` (your project IDs)
-7. Click **Create Web Service**
-
-### Option B: Deploy Manually
-
-1. Install Render CLI: `npm install -g render`
-2. Login: `render login`
-3. Deploy: `render deploy`
-
----
-
-## ⚡ Keep Your Service Awake (CRITICAL!)
-
-**Problem**: Render's free tier spins down after 15 minutes of inactivity.  
-**Solution**: Use UptimeRobot to ping your service every 5 minutes.
-
-### Setup UptimeRobot (Takes 2 minutes)
-
-1. Go to [UptimeRobot](https://uptimerobot.com) and sign up (free)
-2. Click **+ Add New Monitor**
-3. Configure:
-   - **Monitor Type**: HTTP(s)
-   - **Friendly Name**: Supabase Keep-Alive
-   - **URL**: `https://your-service-name.onrender.com` (your Render URL)
-   - **Monitoring Interval**: 5 minutes
-4. Click **Create Monitor**
-
-**Done!** Your service will now stay awake 24/7.
-
----
-
-## 🔍 How to Verify It's Working
-
-### Check Service Status
-
-Visit your Render URL: `https://your-service-name.onrender.com`
-
-You should see:
-```json
-{
-  "status": "✅ Supabase Keep-Alive Service Running",
-  "monitoring": {
-    "project_count": 2,
-    "project_ids": ["abc123", "def456"]
-  },
-  "last_supabase_ping": "2024-01-15T12:00:00.000Z"
-}
-```
-
-### Check Detailed Stats
-
-Visit: `https://your-service-name.onrender.com/stats`
-
-### Trigger Manual Ping
-
-Visit: `https://your-service-name.onrender.com/ping`
-
----
-
-## 📊 Endpoints Reference
-
-| Endpoint | Purpose | Example |
-|----------|---------|---------|
-| `/` | Service status & info | `https://your-app.onrender.com/` |
-| `/health` | Health check (for monitoring) | `https://your-app.onrender.com/health` |
-| `/stats` | Detailed statistics | `https://your-app.onrender.com/stats` |
-| `/ping` | Manual ping trigger | `https://your-app.onrender.com/ping` |
-
----
-
-## ⏰ Ping Schedule
-
-- **Supabase Projects**: Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
-- **Your Service** (via UptimeRobot): Every 5 minutes
-
-### Why 6 hours?
-
-- Supabase pauses after 7 days (168 hours) of inactivity
-- 6-hour pings = 4 pings per day = 28 pings per week
-- Huge buffer to prevent pausing
-
----
-
-## 🐛 Troubleshooting
-
-### Service keeps spinning down
-- ✅ Make sure UptimeRobot monitor is active
-- ✅ Check UptimeRobot is set to 5-minute intervals
-- ✅ Verify the URL in UptimeRobot matches your Render URL
-
-### Supabase projects still pausing
-- ✅ Check `/stats` endpoint to see if pings are successful
-- ✅ Verify your project IDs are correct
-- ✅ Check Render logs for errors: `Logs` tab in Render dashboard
-
-### "No Supabase projects configured" error
-- ✅ Make sure `SUPABASE_PROJECT_IDS` is set in Render environment variables
-- ✅ Don't include `.supabase.co` in the IDs - just the ID part
-
-### How to check Render logs
-1. Go to your service in Render dashboard
-2. Click **Logs** tab
-3. Look for ping confirmations every 6 hours
-
----
-
-## 💰 Cost
-
-**Total: $0/month**
-
-- Render Web Service: Free tier (750 hours/month)
-- UptimeRobot: Free tier (50 monitors, 5-min intervals)
-- Supabase: Free tier stays active!
-
----
-
-## 🔐 Security Notes
-
-- No API keys needed (pings public REST endpoints)
-- No authentication required
-- Service only reads from Supabase (GET requests)
-- All endpoints are safe to expose publicly
-
----
-
-## 📝 Example Configuration
-
-**For 3 Supabase projects:**
-
+2. Start the dev server:
 ```bash
-# .env file
-SUPABASE_PROJECT_IDS=abc123xyz,def456uvw,ghi789rst
+npx wrangler dev --test-scheduled
+```
+Open `http://localhost:8787` and log in with `local-password`.
+
+3. To test the cron job locally, open a second terminal and run:
+```bash
+curl.exe "http://localhost:8787/__scheduled?cron=0+*/6+*+*+*"
 ```
 
-**Service will ping:**
-- `https://abc123xyz.supabase.co/rest/v1/`
-- `https://def456uvw.supabase.co/rest/v1/`
-- `https://ghi789rst.supabase.co/rest/v1/`
-
-**Every 6 hours, automatically!**
-
----
-
-## 🎉 You're Done!
-
-Your Supabase projects will now stay active 24/7 without manual intervention.
-
-**Questions?** Check the `/stats` endpoint or Render logs for diagnostics.
+## Limitations
+- **Single User Only**: The UI does not support multiple accounts. Anyone with the `AUTH_SECRET` has full access.
+- **KV Eventual Consistency**: Cloudflare KV updates are eventually consistent. If you open two browser tabs and add/delete projects at the exact same time, you might lose an update. Use one tab at a time.
