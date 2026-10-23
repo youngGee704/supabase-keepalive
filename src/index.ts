@@ -10,14 +10,22 @@ export interface MaskedSupabaseProject {
   anonKey: string;
 }
 
+export type PingReason = "ok" | "missing_table" | "http_error" | "network_error";
+
 export interface PingResult {
   ok: boolean;
   status: number;
-  error?: string;
+  reason: PingReason;
+}
+
+export interface KVProjectsData {
+  version: 1;
+  projects: SupabaseProject[];
 }
 
 export interface Env {
   SUPABASE_PROJECTS: KVNamespace;
+  AUTH_SECRET?: string;
 }
 
 const KV_PROJECTS_KEY = "projects";
@@ -31,15 +39,29 @@ alter table public.keepalive enable row level security;
 create policy "anon can read keepalive"
   on public.keepalive for select to anon using (true);`;
 
+export function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 export function normalizePingUrl(rawUrl: string): string {
-  let u = rawUrl.trim().replace(/\/+$/, "");
-  if (u.includes("/rest/v1/keepalive")) {
-    return u;
+  const trimmed = rawUrl.trim();
+  const noQuery = trimmed.split("?")[0].split("#")[0].replace(/\/+$/, "");
+
+  if (noQuery.endsWith("/keepalive")) {
+    return `${noQuery}?select=*&limit=1`;
   }
-  if (u.endsWith("/rest/v1")) {
-    return `${u}/keepalive?select=*&limit=1`;
+  if (noQuery.endsWith("/rest/v1")) {
+    return `${noQuery}/keepalive?select=*&limit=1`;
   }
-  return `${u}/rest/v1/keepalive?select=*&limit=1`;
+  if (noQuery.includes("/rest/v1/keepalive")) {
+    return `${noQuery}?select=*&limit=1`;
+  }
+  return `${noQuery}/rest/v1/keepalive?select=*&limit=1`;
 }
 
 export function maskAnonKey(key: string): string {
@@ -61,32 +83,50 @@ export async function pingProject(project: SupabaseProject): Promise<PingResult>
     });
 
     if (res.status === 200) {
-      return { ok: true, status: 200 };
+      return { ok: true, status: 200, reason: "ok" };
     }
 
     if (res.status === 404) {
-      const msg = `${project.name}: keepalive table missing — run migrations/001_keepalive.sql`;
-      console.error(msg);
-      return { ok: false, status: 404, error: msg };
+      console.error(`${project.name}: keepalive table missing — run migrations/001_keepalive.sql`);
+      return { ok: false, status: 404, reason: "missing_table" };
     }
 
-    const msg = `${project.name}: ping failed with status ${res.status}`;
-    console.error(msg);
-    return { ok: false, status: res.status, error: msg };
+    console.error(`${project.name}: ping failed with HTTP status ${res.status}`);
+    return { ok: false, status: res.status, reason: "http_error" };
   } catch (err) {
-    const msg = `${project.name}: network/fetch error: ${err instanceof Error ? err.message : String(err)}`;
-    console.error(msg);
-    return { ok: false, status: 0, error: msg };
+    console.error(`${project.name}: network/fetch error:`, err);
+    return { ok: false, status: 0, reason: "network_error" };
   }
 }
 
 export async function getProjectsFromKV(env: Env): Promise<SupabaseProject[]> {
-  const raw = await env.SUPABASE_PROJECTS.get<SupabaseProject[]>(KV_PROJECTS_KEY, "json");
-  return Array.isArray(raw) ? raw : [];
+  const raw = await env.SUPABASE_PROJECTS.get<unknown>(KV_PROJECTS_KEY, "json");
+  if (!raw) {
+    return [];
+  }
+
+  // Legacy bare-array tolerance
+  if (Array.isArray(raw)) {
+    return raw as SupabaseProject[];
+  }
+
+  // Versioned schema: { version: 1, projects: [...] }
+  if (typeof raw === "object" && raw !== null && "projects" in raw) {
+    const candidate = (raw as Record<string, unknown>).projects;
+    if (Array.isArray(candidate)) {
+      return candidate as SupabaseProject[];
+    }
+  }
+
+  return [];
 }
 
 export async function saveProjectsToKV(env: Env, projects: SupabaseProject[]): Promise<void> {
-  await env.SUPABASE_PROJECTS.put(KV_PROJECTS_KEY, JSON.stringify(projects));
+  const payload: KVProjectsData = {
+    version: 1,
+    projects
+  };
+  await env.SUPABASE_PROJECTS.put(KV_PROJECTS_KEY, JSON.stringify(payload));
 }
 
 export async function pingAllProjects(env: Env): Promise<void> {
@@ -103,7 +143,6 @@ export async function pingAllProjects(env: Env): Promise<void> {
       if (result.ok) {
         console.log(`[Keep-Alive Cron] ✅ ${project.name}: 200 OK`);
       }
-      // Non-200 and errors are already logged with exact format inside pingProject
     } catch (err) {
       console.error(`[Keep-Alive Cron] Unexpected failure pinging ${project.name}:`, err);
     }
@@ -111,7 +150,168 @@ export async function pingAllProjects(env: Env): Promise<void> {
   console.log("[Keep-Alive Cron] Ping cycle completed.");
 }
 
-function renderHtml(): string {
+function parseCookies(cookieHeader: string | null): Record<string, string> {
+  const cookies: Record<string, string> = {};
+  if (!cookieHeader) return cookies;
+  const pairs = cookieHeader.split(";");
+  for (const pair of pairs) {
+    const [name, ...rest] = pair.trim().split("=");
+    if (name && rest.length > 0) {
+      cookies[name] = decodeURIComponent(rest.join("="));
+    }
+  }
+  return cookies;
+}
+
+export function isAuthenticated(request: Request, env: Env): boolean {
+  const secret = env.AUTH_SECRET;
+  if (!secret) {
+    // If AUTH_SECRET is not configured, reject all requests until set
+    return false;
+  }
+
+  // 1. Check Bearer token
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader) {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match && match[1] === secret) {
+      return true;
+    }
+  }
+
+  // 2. Check session cookie
+  const cookieHeader = request.headers.get("Cookie");
+  const cookies = parseCookies(cookieHeader);
+  if (cookies["session"] === secret) {
+    return true;
+  }
+
+  return false;
+}
+
+function renderPasswordForm(hasError: boolean): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Supabase Keep-Alive - Login</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #238636;
+      --accent-hover: #2ea043;
+      --danger: #da3633;
+      --red-text: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.5rem;
+      width: 100%;
+      max-width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    h1 {
+      font-size: 1.2rem;
+      letter-spacing: -0.02em;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+    }
+    .error-box {
+      background: #da363326;
+      border: 1px solid var(--danger);
+      color: var(--red-text);
+      padding: 0.5rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+    }
+    form {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      letter-spacing: 0.05em;
+    }
+    input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.5rem 0.75rem;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      outline: none;
+    }
+    input:focus {
+      border-color: #58a6ff;
+    }
+    button {
+      font-family: inherit;
+      font-size: 0.85rem;
+      padding: 0.5rem 1rem;
+      border-radius: 4px;
+      border: 1px solid rgba(240, 246, 252, 0.1);
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+    }
+    button:hover {
+      background: var(--accent-hover);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div>
+      <h1>Supabase Keep-Alive</h1>
+      <p>Enter AUTH_SECRET to access dashboard</p>
+    </div>
+    ${hasError ? `<div class="error-box">Invalid password. Please try again.</div>` : ""}
+    <form method="POST" action="/auth">
+      <div class="field">
+        <label for="password">Secret Key</label>
+        <input type="password" id="password" name="password" required autofocus autocomplete="current-password" />
+      </div>
+      <button type="submit">Unlock</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+function renderDashboardHtml(): string {
+  const escapedSql = escapeHtml(MIGRATION_SQL);
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -151,6 +351,12 @@ function renderHtml(): string {
       display: flex;
       flex-direction: column;
       gap: 2rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
     }
     header h1 {
       font-size: 1.5rem;
@@ -370,8 +576,13 @@ function renderHtml(): string {
 <body>
   <div class="container">
     <header>
-      <h1>Supabase Keep-Alive</h1>
-      <p>Cloudflare Workers cron pinger (every 6 hours) &bull; KV Storage</p>
+      <div>
+        <h1>Supabase Keep-Alive</h1>
+        <p>Cloudflare Workers cron pinger (every 6 hours) &bull; KV Storage</p>
+      </div>
+      <form method="POST" action="/auth/logout" style="margin: 0;">
+        <button type="submit" class="btn-action btn-danger">Logout</button>
+      </form>
     </header>
 
     <div id="alert"></div>
@@ -400,7 +611,7 @@ function renderHtml(): string {
         <summary>Setup SQL — run this in the project's SQL editor before saving</summary>
         <div class="sql-box">
           <button type="button" class="copy-btn" id="copy-sql-btn" onclick="copySql()">Copy SQL</button>
-          <pre id="migration-sql">${MIGRATION_SQL}</pre>
+          <pre id="migration-sql">${escapedSql}</pre>
         </div>
       </details>
     </section>
@@ -450,10 +661,21 @@ function renderHtml(): string {
       }
     }
 
+    async function handleApiResponse(res) {
+      if (res.status === 401) {
+        window.location.href = "/";
+        return null;
+      }
+      return res;
+    }
+
     async function loadProjects() {
       const tbody = document.getElementById("projects-tbody");
       try {
-        const res = await fetch("/api/projects");
+        const rawRes = await fetch("/api/projects");
+        const res = await handleApiResponse(rawRes);
+        if (!res) return;
+
         if (!res.ok) throw new Error("HTTP " + res.status);
         const projects = await res.json();
         renderTable(projects);
@@ -533,8 +755,8 @@ function renderHtml(): string {
       if (res.ok) {
         cell.innerHTML = '<span class="status-ok">✅ 200</span>';
       } else {
-        const label = res.status ? res.status : (res.error ? escapeHtml(res.error) : "failed");
-        cell.innerHTML = '<span class="status-err">❌ ' + label + '</span> <span class="badge badge-untested" style="margin-left:4px;">untested</span>';
+        const reasonText = res.reason ? escapeHtml(res.reason) : (res.status ? res.status : "failed");
+        cell.innerHTML = '<span class="status-err">❌ ' + reasonText + '</span> <span class="badge badge-untested" style="margin-left:4px;">untested</span>';
       }
     }
 
@@ -545,18 +767,21 @@ function renderHtml(): string {
       }
 
       try {
-        const res = await fetch("/api/test?name=" + encodeURIComponent(name), { method: "POST" });
+        const rawRes = await fetch("/api/test?name=" + encodeURIComponent(name), { method: "POST" });
+        const res = await handleApiResponse(rawRes);
+        if (!res) return;
+
         const data = await res.json();
         testResults.set(name, {
           ok: data.ok,
           status: data.status,
-          error: data.error
+          reason: data.reason
         });
       } catch (err) {
         testResults.set(name, {
           ok: false,
           status: 0,
-          error: err.message
+          reason: "network_error"
         });
       }
 
@@ -570,7 +795,10 @@ function renderHtml(): string {
         return;
       }
       try {
-        const res = await fetch("/api/projects?name=" + encodeURIComponent(name), { method: "DELETE" });
+        const rawRes = await fetch("/api/projects?name=" + encodeURIComponent(name), { method: "DELETE" });
+        const res = await handleApiResponse(rawRes);
+        if (!res) return;
+
         if (!res.ok) {
           const err = await res.json();
           throw new Error(err.error || "Failed to delete");
@@ -603,11 +831,13 @@ function renderHtml(): string {
       addBtn.textContent = "Saving & Testing...";
 
       try {
-        const res = await fetch("/api/projects", {
+        const rawRes = await fetch("/api/projects", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, url, anonKey })
         });
+        const res = await handleApiResponse(rawRes);
+        if (!res) return;
 
         const data = await res.json();
         if (!res.ok) {
@@ -617,7 +847,7 @@ function renderHtml(): string {
         testResults.set(name, {
           ok: data.pingOk,
           status: data.pingStatus,
-          error: data.error
+          reason: data.reason
         });
 
         nameInput.value = "";
@@ -627,7 +857,7 @@ function renderHtml(): string {
         if (data.pingOk) {
           showAlert("Project \\"" + name + "\\" added and verified (✅ 200).");
         } else {
-          showAlert("Project \\"" + name + "\\" added, but initial ping failed (status " + data.pingStatus + "). Marked untested.", false);
+          showAlert("Project \\"" + name + "\\" added, but initial ping failed (" + data.reason + "). Marked untested.", false);
         }
 
         await loadProjects();
@@ -650,141 +880,243 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const { pathname, searchParams } = url;
   const method = request.method.toUpperCase();
 
+  // Route: POST /auth
+  if (method === "POST" && pathname === "/auth") {
+    let password = "";
+    const contentType = request.headers.get("content-type") || "";
+
+    if (contentType.includes("application/x-www-form-urlencoded") || contentType.includes("multipart/form-data")) {
+      const formData = await request.formData();
+      password = (formData.get("password") as string || "").trim();
+    } else if (contentType.includes("application/json")) {
+      try {
+        const body = await request.json() as { password?: string };
+        password = (body.password || "").trim();
+      } catch {
+        password = "";
+      }
+    }
+
+    if (env.AUTH_SECRET && password === env.AUTH_SECRET) {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          "Location": "/",
+          "Set-Cookie": `session=${encodeURIComponent(env.AUTH_SECRET)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000`
+        }
+      });
+    }
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": "/?error=invalid_password"
+      }
+    });
+  }
+
+  // Route: POST /auth/logout
+  if (method === "POST" && pathname === "/auth/logout") {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": "/",
+        "Set-Cookie": "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+      }
+    });
+  }
+
   // Route: GET /
   if (method === "GET" && pathname === "/") {
-    return new Response(renderHtml(), {
+    if (!isAuthenticated(request, env)) {
+      const hasError = searchParams.get("error") === "invalid_password";
+      return new Response(renderPasswordForm(hasError), {
+        status: 401,
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+
+    return new Response(renderDashboardHtml(), {
       status: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" }
     });
   }
 
-  // Route: GET /api/projects
-  if (method === "GET" && pathname === "/api/projects") {
-    const projects = await getProjectsFromKV(env);
-    const masked: MaskedSupabaseProject[] = projects.map(p => ({
-      name: p.name,
-      url: p.url,
-      anonKey: maskAnonKey(p.anonKey)
-    }));
-
-    return new Response(JSON.stringify(masked), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  // Route: POST /api/projects
-  if (method === "POST" && pathname === "/api/projects") {
-    let body: Partial<SupabaseProject>;
-    try {
-      body = await request.json();
-    } catch {
-      return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-        status: 400,
+  // All /api/* routes require authentication
+  if (pathname.startsWith("/api/")) {
+    if (!isAuthenticated(request, env)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
         headers: { "Content-Type": "application/json" }
       });
     }
 
-    const name = typeof body.name === "string" ? body.name.trim() : "";
-    const projectUrl = typeof body.url === "string" ? body.url.trim() : "";
-    const anonKey = typeof body.anonKey === "string" ? body.anonKey.trim() : "";
+    // Route: GET /api/projects
+    if (method === "GET" && pathname === "/api/projects") {
+      const projects = await getProjectsFromKV(env);
+      const masked: MaskedSupabaseProject[] = projects.map(p => ({
+        name: p.name,
+        url: p.url,
+        anonKey: maskAnonKey(p.anonKey)
+      }));
 
-    if (!name || !projectUrl || !anonKey) {
-      return new Response(JSON.stringify({ error: "name, url, and anonKey are required and must be non-empty" }), {
-        status: 400,
+      return new Response(JSON.stringify(masked), {
+        status: 200,
         headers: { "Content-Type": "application/json" }
       });
     }
 
-    const projects = await getProjectsFromKV(env);
-    if (projects.some(p => p.name.toLowerCase() === name.toLowerCase())) {
-      return new Response(JSON.stringify({ error: `Project with name "${name}" already exists` }), {
-        status: 409,
+    // Route: POST /api/projects
+    if (method === "POST" && pathname === "/api/projects") {
+      let body: Partial<SupabaseProject>;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      const projectUrl = typeof body.url === "string" ? body.url.trim() : "";
+      const anonKey = typeof body.anonKey === "string" ? body.anonKey.trim() : "";
+
+      if (!name || !projectUrl || !anonKey) {
+        return new Response(JSON.stringify({ error: "name, url, and anonKey are required and must be non-empty" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const newProject: SupabaseProject = { name, url: projectUrl, anonKey };
+
+      // Write-verify-retry loop (up to 3 attempts) to prevent lost updates
+      let persisted = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const current = await getProjectsFromKV(env);
+        if (current.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+          return new Response(JSON.stringify({ error: `Project with name "${name}" already exists` }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const updated = [...current, newProject];
+        await saveProjectsToKV(env, updated);
+
+        // Read back and verify write landed
+        const verified = await getProjectsFromKV(env);
+        if (verified.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+          persisted = true;
+          break;
+        }
+        console.warn(`[KV Conflict] Write verification failed on attempt ${attempt}/3. Retrying...`);
+      }
+
+      if (!persisted) {
+        return new Response(JSON.stringify({ error: "Failed to persist project after 3 attempts due to concurrent KV updates" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      // Test ping after saving (do not block saving on failure)
+      const pingResult = await pingProject(newProject);
+
+      return new Response(JSON.stringify({
+        success: true,
+        project: {
+          name: newProject.name,
+          url: newProject.url,
+          anonKey: maskAnonKey(newProject.anonKey)
+        },
+        pingOk: pingResult.ok,
+        pingStatus: pingResult.status,
+        reason: pingResult.reason
+      }), {
+        status: 201,
         headers: { "Content-Type": "application/json" }
       });
     }
 
-    const newProject: SupabaseProject = { name, url: projectUrl, anonKey };
-    projects.push(newProject);
-    await saveProjectsToKV(env, projects);
+    // Route: DELETE /api/projects?name=xxx
+    if (method === "DELETE" && pathname === "/api/projects") {
+      const name = searchParams.get("name")?.trim();
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Query param 'name' is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
 
-    // Test ping after saving (do not block saving on failure)
-    const pingResult = await pingProject(newProject);
+      let deleted = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const projects = await getProjectsFromKV(env);
+        const filtered = projects.filter(p => p.name.toLowerCase() !== name.toLowerCase());
 
-    return new Response(JSON.stringify({
-      success: true,
-      project: {
-        name: newProject.name,
-        url: newProject.url,
-        anonKey: maskAnonKey(newProject.anonKey)
-      },
-      pingOk: pingResult.ok,
-      pingStatus: pingResult.status,
-      error: pingResult.error
-    }), {
-      status: 201,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
+        if (filtered.length === projects.length) {
+          return new Response(JSON.stringify({ error: `Project "${name}" not found` }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
 
-  // Route: DELETE /api/projects?name=xxx
-  if (method === "DELETE" && pathname === "/api/projects") {
-    const name = searchParams.get("name")?.trim();
-    if (!name) {
-      return new Response(JSON.stringify({ error: "Query param 'name' is required" }), {
-        status: 400,
+        await saveProjectsToKV(env, filtered);
+
+        // Verify delete landed
+        const verified = await getProjectsFromKV(env);
+        if (!verified.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+          deleted = true;
+          break;
+        }
+        console.warn(`[KV Conflict] Delete verification failed on attempt ${attempt}/3. Retrying...`);
+      }
+
+      if (!deleted) {
+        return new Response(JSON.stringify({ error: "Failed to delete project after 3 attempts due to concurrent KV updates" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
         headers: { "Content-Type": "application/json" }
       });
     }
 
-    const projects = await getProjectsFromKV(env);
-    const updated = projects.filter(p => p.name.toLowerCase() !== name.toLowerCase());
+    // Route: POST /api/test?name=xxx
+    if (method === "POST" && pathname === "/api/test") {
+      const name = searchParams.get("name")?.trim();
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Query param 'name' is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
 
-    if (updated.length === projects.length) {
-      return new Response(JSON.stringify({ error: `Project "${name}" not found` }), {
-        status: 404,
+      const projects = await getProjectsFromKV(env);
+      const target = projects.find(p => p.name.toLowerCase() === name.toLowerCase());
+
+      if (!target) {
+        return new Response(JSON.stringify({ error: "project not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const result = await pingProject(target);
+
+      return new Response(JSON.stringify({
+        ok: result.ok,
+        status: result.status,
+        reason: result.reason
+      }), {
+        status: 200,
         headers: { "Content-Type": "application/json" }
       });
     }
-
-    await saveProjectsToKV(env, updated);
-
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  // Route: POST /api/test?name=xxx
-  if (method === "POST" && pathname === "/api/test") {
-    const name = searchParams.get("name")?.trim();
-    if (!name) {
-      return new Response(JSON.stringify({ error: "Query param 'name' is required" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    const projects = await getProjectsFromKV(env);
-    const target = projects.find(p => p.name.toLowerCase() === name.toLowerCase());
-
-    if (!target) {
-      return new Response(JSON.stringify({ error: "project not found" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    const result = await pingProject(target);
-
-    return new Response(JSON.stringify({
-      ok: result.ok,
-      status: result.status,
-      error: result.error
-    }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    });
   }
 
   return new Response(JSON.stringify({ error: "Not Found" }), {
